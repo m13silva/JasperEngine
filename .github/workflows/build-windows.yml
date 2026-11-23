@@ -1,0 +1,39 @@
+name: Build Windows Editor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: JasperEngine Editor (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build editor
+        run: tools/ci/windows.sh editor
+
+      - name: Upload editor
+        uses: actions/upload-artifact@v4
+        with:
+          name: JasperEngine-Windows-x64
+          path: instdir/bin/
+          if-no-files-found: error
