@@ -1,4 +1,3 @@
-
 name: Build Windows Editor
 
 on:
@@ -23,39 +22,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # El editor oficial utiliza el Vulkan SDK.
-      - name: Install Vulkan SDK
-        id: vulkan-sdk
-        continue-on-error: true
-        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
-        with:
-          vulkan_version: 1.3.296.0
-          install_runtime: false
-          cache: true
-          cache_save_if: false
-
-      - name: Retry Vulkan SDK installation
-        if: steps.vulkan-sdk.outcome == 'failure'
-        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1.8.1
-        with:
-          vulkan_version: 1.3.296.0
-          install_runtime: false
-          cache: true
-          cache_save_if: false
-
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
-      # Recupera la caché del compilador.
       - name: Restore ccache
         uses: ./.github/actions/ccache-restore
         with:
           lane: windows
           max-size: 2G
 
-      # Solo editor y CLI; EDITOR_TESTS=0 excluye los tests.
       - name: Build editor
         run: tools/ci/windows.sh editor
 
