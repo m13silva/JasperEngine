@@ -1,6 +1,7 @@
 // (c) Eduardo Doria and contributors
 // SPDX-License-Identifier: MIT
 
+#include "util/CppIdentifier.h"
 #include "TerrainQualityPanel.h"
 #include "Engine.h"
 #include "mcp/TerrainMaterialInfo.h"
@@ -55,6 +56,7 @@
 #include "util/Fnv.h"
 #include "util/UIUtils.h"
 #include "util/FileDialogs.h"
+#include "asset/MeshAssetFiles.h"
 #include "script/ScriptScheduler.h"
 #include "util/FileUtils.h"
 #include "window/CodeEditor.h"
@@ -93,6 +95,9 @@
 #include "command/type/ModelLoadCmd.h"
 #include "command/type/SetMainCameraCmd.h"
 #include "command/type/AddComponentCmd.h"
+#include "command/type/AudioSourceSlotCmd.h"
+#include "component/AudioSourceComponent.h"
+#include "object/sound/AudioSourceSlots.h"
 #include "command/type/RemoveComponentCmd.h"
 #include "command/type/ComponentToPrefabSharedCmd.h"
 #include "command/type/ComponentValuesCmd.h"
@@ -117,7 +122,6 @@
 #include "Screen.h"
 #include "window/DeviceProfiles.h"
 #include "Widgets.h"
-#include "Factory.h"
 #include "audio/AudioMixer.h"
 #include "pool/SoundPool.h"
 #include "component/ActionComponent.h"
@@ -477,7 +481,9 @@ void editor::InspectorWindow::drawScenePropertyRow(SceneProject* sceneProject, c
             break;
         case ScenePropertyInputType::DragInt:
             if constexpr (std::is_same_v<T, int>) {
-                changed = ImGui::DragInt(("##" + propertyName).c_str(), &value, 1.0f, (int)minValue, (int)maxValue);
+                // Light Steps' 0 is Off
+                const char* format = (propertyName == "light_2d_steps" && value == 0) ? "Off" : "%d";
+                changed = ImGui::DragInt(("##" + propertyName).c_str(), &value, 1.0f, (int)minValue, (int)maxValue, format);
             }
             break;
         case ScenePropertyInputType::SliderFloat:
@@ -556,6 +562,14 @@ void editor::InspectorWindow::drawScenePropertyRow(SceneProject* sceneProject, c
                     value = static_cast<WaterWakeResolution>(currentItem);
                 }
             }
+            if constexpr (std::is_same_v<T, UIRenderMode>) {
+                const char* modeNames[] = { "Screen Space - Overlay", "Screen Space - Camera" };
+                int currentItem = std::clamp(static_cast<int>(value), 0, 1);
+                changed = ImGui::Combo(("##" + propertyName).c_str(), &currentItem, modeNames, IM_ARRAYSIZE(modeNames));
+                if (changed) {
+                    value = static_cast<UIRenderMode>(currentItem);
+                }
+            }
             if constexpr (std::is_same_v<T, SceneColorScale>) {
                 const char* scaleNames[] = { "Full", "Half" };
                 int currentItem = static_cast<int>(value);
@@ -609,6 +623,20 @@ void editor::InspectorWindow::drawScenePropertyRow(SceneProject* sceneProject, c
                     Command* maskCmd = new ScenePropertyCmd<T>(project, sceneProject->id, propertyName, value);
                     CommandHandle::get(sceneProject->id)->addCommandNoMerge(maskCmd);
                     changed = false;
+                }
+            }
+            break;
+        case ScenePropertyInputType::SampleCount:
+            if constexpr (std::is_same_v<T, int>) {
+                const char* countNames[] = { "Project Default", "Disabled", "2x", "4x", "8x" };
+                const int countValues[] = { 0, 1, 2, 4, 8 };
+                int currentItem = 0;
+                for (int c = 0; c < IM_ARRAYSIZE(countValues); c++) {
+                    if (countValues[c] == value) currentItem = c;
+                }
+                changed = ImGui::Combo(("##" + propertyName).c_str(), &currentItem, countNames, IM_ARRAYSIZE(countNames));
+                if (changed) {
+                    value = countValues[currentItem];
                 }
             }
             break;
@@ -1796,17 +1824,58 @@ void editor::InspectorWindow::handleComponentMenu(const char* popupId, SceneProj
                 RagdollWizardDialog::instance().open(project, sceneProject->id, entities[0]);
             }
         }
+        if (cpType == ComponentType::MeshComponent && entities.size() == 1) {
+            // S98 F1: the geometry to a .mesh the Mesh field then shows (Unity's Save Mesh As Asset)
+            reason.clear();
+            const bool canSave = MeshAssetFiles::ownsGeometry(sceneProject->scene, entities[0], &reason);
+            if (ImGui::MenuItem("Save Mesh As Asset...", nullptr, false, canSave)) {
+                const std::string name = sceneProject->scene->getEntityName(entities[0]);
+                const std::string chosen = FileDialogs::saveFileDialog(project->getAssetsPath().string(), (name.empty() ? "New Mesh" : name) + ".mesh",
+                                                                       "Mesh assets", "mesh");
+                if (!chosen.empty()) {
+                    std::string path = FileUtils::pathToGenericUtf8(project->normalizeToProjectRelative(FileUtils::pathFromUtf8(chosen)));
+                    if (!Util::isMeshAssetFile(path)) path += ".mesh";
+                    std::string written, error;
+                    Command* save = MeshAssetFiles::saveAs(*project, sceneProject->id, entities[0], sceneProject->scene->getComponent<MeshComponent>(entities[0]),
+                                                           path, written, &error);
+                    if (save) {
+                        addMenuCommand(save);
+                    } else {
+                        Out::error("Save Mesh As Asset: %s", error.c_str());
+                    }
+                }
+            }
+            reasonTooltip(canSave, reason);
+        }
         ImGui::Separator();
 
+        // a further Audio Source of its GameObject (S97 REQ-26): removed with its entity, reordered
+        // among the GameObject's slots
+        const bool audioSlot = cpType == ComponentType::AudioSourceComponent && entities.size() == 1 &&
+                               AudioSourceSlots::isSlot(sceneProject->scene, entities[0]);
         bool canRemove = !(cpType == ComponentType::Transform && isPrefab);
         if (ImGui::MenuItem("Remove Component", nullptr, false, canRemove)) {
-            for (Entity& entity : entities){
-                cmd = new RemoveComponentCmd(project, sceneProject->id, entity, cpType);
-                CommandHandle::get(project->getSelectedSceneId())->addCommand(cmd);
+            if (audioSlot){
+                addMenuCommand(new RemoveAudioSourceSlotCmd(project, sceneProject->id, entities[0]));
+            }else{
+                for (Entity& entity : entities){
+                    cmd = new RemoveComponentCmd(project, sceneProject->id, entity, cpType);
+                    CommandHandle::get(project->getSelectedSceneId())->addCommand(cmd);
+                }
+                cmd->setNoMerge();
             }
-            cmd->setNoMerge();
 
             headerOpen = false;
+        }
+        if (audioSlot){
+            for (int direction : {-1, 1}){
+                Command* move = buildMoveAudioSourceSlot(project, sceneProject->id, entities[0], direction);
+                if (ImGui::MenuItem(direction < 0 ? "Move Up" : "Move Down", nullptr, false, move != nullptr)){
+                    addMenuCommand(move);
+                }else{
+                    delete move;
+                }
+            }
         }
 
         ImGui::EndDisabled();
@@ -1894,6 +1963,22 @@ void editor::InspectorWindow::handleComponentMenu(const char* popupId, SceneProj
 }
 
 void editor::InspectorWindow::addComponents(SceneProject* sceneProject, const std::vector<Entity>& entities, ComponentType cpType) {
+    // an Audio Source on a GameObject that has one is a further one, a slot (S97 REQ-26): one step
+    if (cpType == ComponentType::AudioSourceComponent &&
+        std::any_of(entities.begin(), entities.end(), [sceneProject](Entity entity) {
+            return sceneProject->scene->findComponent<AudioSourceComponent>(entity) != nullptr;
+        })) {
+        auto* multi = new MultiPropertyCmd();
+        for (Entity entity : entities) {
+            if (sceneProject->scene->findComponent<AudioSourceComponent>(entity)) {
+                multi->addCommand(std::make_unique<AddAudioSourceSlotCmd>(project, sceneProject->id, entity));
+            } else {
+                multi->addCommand(std::make_unique<AddComponentCmd>(project, sceneProject->id, entity, cpType));
+            }
+        }
+        CommandHandle::get(project->getSelectedSceneId())->addCommandNoMerge(multi);
+        return;
+    }
     // Add component to all selected entities
     Command* last = nullptr;
     for (const Entity& entity : entities) {
@@ -1929,6 +2014,9 @@ bool editor::InspectorWindow::addComponentToSelection(ComponentType type, std::s
 }
 
 bool editor::InspectorWindow::canAddComponent(SceneProject* sceneProject, Entity entity, ComponentType cpType) {
+    // a GameObject takes several Audio Sources (S97 REQ-26)
+    if (cpType == ComponentType::AudioSourceComponent)
+        return AddAudioSourceSlotCmd::refusal(sceneProject->scene, entity).empty();
     // Check if entity already has this component
     std::vector<ComponentType> existingComponents = Catalog::findComponents(sceneProject->scene, entity);
     if (std::find(existingComponents.begin(), existingComponents.end(), cpType) != existingComponents.end())
@@ -2016,6 +2104,25 @@ void editor::InspectorWindow::drawSceneWaterWakes(SceneProject* sceneProject, Im
         "Metres the wake map spans around the main camera; wakes farther away are not drawn. A smaller area shows finer wakes.");
     drawScenePropertyRow<float>(sceneProject, "water_wake_fade", "Fade", ScenePropertyInputType::DragFloat, -1.0f, 0.1f, 120.0f,
         "Seconds a wake takes to fade (an eighth of its foam is left by then, as scattered foam).");
+    ImGui::EndTable();
+}
+
+void editor::InspectorWindow::drawSceneHtmlUi(SceneProject* sceneProject, ImGuiTableFlags tableFlags){
+    ImGui::SeparatorText("HTML UI");
+    if (!ImGui::BeginTable("scene_html_ui_table", 2, tableFlags))
+        return;
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Anti-aliasing (MSAA)"));
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+    const float comboWidth = ImGui::CalcTextSize("Screen Space - Overlay").x + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f;
+    drawScenePropertyRow<UIRenderMode>(sceneProject, "html_ui_render_mode", "Render Mode", ScenePropertyInputType::Combo, comboWidth, 0.0f, 1.0f,
+        "Where the scene's screen UI Documents draw. Screen Space - Overlay: after post-processing, at the output resolution, "
+        "so Render Scale, FXAA, CRT and the other effects leave them sharp. Screen Space - Camera: in the camera's pass, "
+        "so Render Scale and post-processing apply to them too.");
+    drawScenePropertyRow<int>(sceneProject, "html_ui_msaa_samples", "Anti-aliasing (MSAA)", ScenePropertyInputType::SampleCount, comboWidth, 0.0f, 8.0f,
+        "Multisampling of the scene's screen UI Documents (and of Texture-mode documents set to Scene Default). Project Default: "
+        "Project Settings > Graphics > HTML UI MSAA (Auto: 1 sample on phones and the web, 4 on desktop). More samples smooth "
+        "rotated and curved edges at more GPU memory; rounded boxes and clips antialias at any count.");
     ImGui::EndTable();
 }
 
@@ -2459,6 +2566,27 @@ bool editor::InspectorWindow::drawComponentHeader(SceneProject* sceneProject, co
     return open;
 }
 
+void editor::InspectorWindow::drawAudioSourceSlots(SceneProject* sceneProject, Entity owner, bool readOnly){
+    Scene* scene = sceneProject->scene;
+    for (Entity slot : AudioSourceSlots::getSlots(scene, owner)) {
+        const std::vector<Entity> slotEntities = {slot};
+        PrefabObjectRef ref;
+        const bool isPrefab = project->findPrefabObject(sceneProject->id, slot, ref);
+        ImGui::PushID("audio_source_slot");
+        ImGui::PushID(static_cast<int>(slot));
+        // (its rows are not in the Inspector layout: that names one component of a type)
+        if (drawComponentHeader(sceneProject, slotEntities, ComponentType::AudioSourceComponent, isPrefab, readOnly)) {
+            beginPrefabComponent(sceneProject, slotEntities, ComponentType::AudioSourceComponent, readOnly);
+            if (readOnly) ImGui::BeginDisabled(true);
+            drawAudioComponent(ComponentType::AudioSourceComponent, sceneProject, slotEntities);
+            if (readOnly) ImGui::EndDisabled();
+            endPrefabComponent();
+        }
+        ImGui::PopID();
+        ImGui::PopID();
+    }
+}
+
 void editor::InspectorWindow::drawAddComponentButton(SceneProject* sceneProject, const std::vector<Entity>& entities, bool readOnly, bool forceOpen){
     const ImGuiStyle& style = ImGui::GetStyle();
 
@@ -2525,6 +2653,10 @@ void editor::InspectorWindow::drawAddComponentButton(SceneProject* sceneProject,
                 attachScriptFile(sceneProject, entities, script.file);
             });
         }
+        componentAddDialog.setAudioFilters([this](const std::string& effect) {
+            std::string why;
+            if (!addAudioEffectToSelection(effect, &why)) Out::warning("Add Component: %s", why.c_str());
+        });
     }
     ImGui::EndDisabled();
 
@@ -8018,7 +8150,7 @@ void editor::InspectorWindow::drawMeshComponent(ComponentType cpType, SceneProje
     drawMeshComponentFields(cpType, sceneProject, entities);
     ImGui::EndDisabled();
     const ImVec2 fieldsBottom(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), ImGui::GetCursorScreenPos().y);
-    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::IsMouseHoveringRect(fieldsTop, fieldsBottom)) {
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(fieldsTop, fieldsBottom)) {
         ImGui::SetTooltip("Edit the parts");
     }
 }
@@ -8028,6 +8160,16 @@ void editor::InspectorWindow::drawMeshComponentFields(ComponentType cpType, Scen
 
     // Static variables for shape parameters
     static PrimitiveParameters shapeParams;
+
+    // S98 F1: the .mesh the geometry comes from (Unity's Mesh Filter's Mesh), for meshes whose
+    // geometry is not a model's or a generator's
+    bool meshAssetRow = !entities.empty();
+    for (Entity entity : entities) meshAssetRow = meshAssetRow && MeshAssetFiles::canShowMeshAsset(sceneProject->scene, entity);
+    if (meshAssetRow) {
+        RowSettings settingsMeshAsset;
+        settingsMeshAsset.help = "The .mesh asset the geometry comes from; none: the mesh's own (the component's menu > Save Mesh As Asset... makes one)";
+        propertyRow(RowPropertyType::Asset, cpType, "meshAsset", "Mesh", sceneProject, entities, settingsMeshAsset);
+    }
 
     // Add New Geometry property row
     propertyHeader("Geometry");
@@ -10195,6 +10337,14 @@ void editor::InspectorWindow::drawAudioComponent(ComponentType cpType, SceneProj
     panSettings.help = "-1 left, 0 center, 1 right";
     propertyRow(RowPropertyType::Float, cpType, "pan", "Pan", sceneProject, entities, panSettings);
 
+    // Unity's Spatial Blend (S97 REQ-18, REQ-38)
+    RowSettings blendSettings = floatSettings;
+    blendSettings.floatMin = 0.0f;
+    blendSettings.floatMax = 1.0f;
+    blendSettings.format = "2D %.2f 3D";
+    blendSettings.help = "0 plays 2D (Pan, no distance attenuation); 1 plays 3D from the GameObject's position; between them a mix without Doppler. A source without a Transform plays 2D.";
+    propertyRow(RowPropertyType::Float_0_1, cpType, "spatialBlend", "Spatial Blend", sceneProject, entities, blendSettings);
+
     propertyRow(RowPropertyType::Bool, cpType, "looping", "Looping", sceneProject, entities, compactSettings);
     propertyRow(RowPropertyType::DoublePositive, cpType, "loopingPoint", "Loop Point", sceneProject, entities, doubleSettings);
     propertyRow(RowPropertyType::Bool, cpType, "protectVoice", "Protect Voice", sceneProject, entities, compactSettings);
@@ -10240,10 +10390,12 @@ void editor::InspectorWindow::drawAudioComponent(ComponentType cpType, SceneProj
         }
     }
 
+    // the 3D settings matter where the blend has some 3D and a Transform places it
     bool show3DSettings = false;
     for (Entity entity : entities){
         Signature signature = sceneProject->scene->getSignature(entity);
-        show3DSettings = show3DSettings || signature.test(sceneProject->scene->getComponentId<Transform>());
+        show3DSettings = show3DSettings || (signature.test(sceneProject->scene->getComponentId<Transform>()) &&
+                                            sceneProject->scene->getComponent<AudioSourceComponent>(entity).spatialBlend > 0.0f);
     }
 
     endTable();
@@ -10264,6 +10416,8 @@ void editor::InspectorWindow::drawAudioComponent(ComponentType cpType, SceneProj
         endTable();
     }
 
+    // S97 WP-B: the source's own effects (Unity's filter components, below the source)
+    drawAudioEffectRows(cpType, sceneProject, entities);
 }
 
 void editor::InspectorWindow::drawTilemapComponent(ComponentType cpType, SceneProject* sceneProject, std::vector<Entity> entities){
@@ -11952,7 +12106,14 @@ void editor::InspectorWindow::drawUIDocumentComponent(ComponentType cpType, Scen
     ratioSettings.format = (document.pixelRatio == 0.0f) ? "Auto" : "%.2f";
     ratioSettings.help = "Document pixels per CSS pixel. 0 = Auto: the canvas-to-screen scale (1 in Texture mode).";
 
-    beginTable(cpType, getLabelSize("Texture Height"));
+    // S92 R18: a texture-mode document has a context and target of its own
+    static std::vector<EnumEntry> msaaEntries = {{0, "Scene Default"}, {1, "Disabled"}, {2, "2x"}, {4, "4x"}, {8, "8x"}};
+    RowSettings msaaSettings;
+    msaaSettings.enumEntries = &msaaEntries;
+    msaaSettings.help = "Multisampling of this document's texture. Scene Default: the scene's HTML UI Anti-aliasing (MSAA). "
+                        "Screen documents share the scene's target, so the scene setting decides for them.";
+
+    beginTable(cpType, getLabelSize("Anti-aliasing (MSAA)"));
 
     if (entities.size() == 1) {
         Entity entity = entities[0];
@@ -12081,6 +12242,7 @@ void editor::InspectorWindow::drawUIDocumentComponent(ComponentType cpType, Scen
         propertyRow(RowPropertyType::Int, cpType, "textureWidth", "Texture Width", sceneProject, entities, sizeSettings);
         propertyRow(RowPropertyType::Int, cpType, "textureHeight", "Texture Height", sceneProject, entities, sizeSettings);
         propertyRow(RowPropertyType::LocalEntity, cpType, "inputSurface", "Input Surface", sceneProject, entities, surfaceSettings);
+        propertyRow(RowPropertyType::Enum, cpType, "msaaSamples", "Anti-aliasing (MSAA)", sceneProject, entities, msaaSettings);
     }
     propertyRow(RowPropertyType::FloatPositive, cpType, "pixelRatio", "Pixel Ratio", sceneProject, entities, ratioSettings);
 
@@ -13018,7 +13180,7 @@ void editor::InspectorWindow::drawScriptComponent(ComponentType cpType, ScenePro
                     // Script dialog uses - since className is emitted verbatim as a
                     // class token by the code generator. Reflect it back in the field.
                     if (!newName.empty() && script.type != ScriptType::LUA) {
-                        newName = Factory::toIdentifier(newName);
+                        newName = toIdentifier(newName);
                         strncpy(nameBuffer, newName.c_str(), sizeof(nameBuffer) - 1);
                         nameBuffer[sizeof(nameBuffer) - 1] = '\0';
                     }
@@ -13788,6 +13950,13 @@ void editor::InspectorWindow::show(){
                 if (compReadOnly) ImGui::EndDisabled();
                 endPrefabComponent();
             }
+            if (cpType == ComponentType::AudioSourceComponent && entities.size() == 1) {
+                drawAudioSourceSlots(sceneProject, entities[0], isRuntimeSelection || documentLocked);
+            }
+        }
+        // slots whose GameObject has no Audio Source of its own come after its components
+        if (entities.size() == 1 && !scene->findComponent<AudioSourceComponent>(entities[0])) {
+            drawAudioSourceSlots(sceneProject, entities[0], isRuntimeSelection || documentLocked);
         }
 
         if (isPrefab) {
@@ -13840,11 +14009,17 @@ void editor::InspectorWindow::show(){
                 ImGui::SeparatorText("Ambient Light (2D)");
 
                 if (ImGui::BeginTable("scene_ambient2d_table", 2, tableFlags)) {
-                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Intensity"));
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Without Lights"));
                     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
                     drawScenePropertyRow<Vector3>(sceneProject, "ambient_light_2d_color", "Color", ScenePropertyInputType::ColorRGB);
                     drawScenePropertyRow<float>(sceneProject, "ambient_light_2d_intensity", "Intensity", ScenePropertyInputType::SliderFloat, -1.0f, 0.0f, 1.0f);
+                    drawScenePropertyRow<int>(sceneProject, "light_2d_steps", "Light Steps", ScenePropertyInputType::DragInt, 6 * ImGui::GetFontSize(), 0.0f, 16.0f,
+                        "Draws each 2D light in this many hard bands, the stepped look of pixel-art lighting (6 is a common choice). "
+                        "Off keeps the light smooth. The ambient is not banded.");
+                    drawScenePropertyRow<bool>(sceneProject, "ambient_light_2d_without_lights", "Without Lights", ScenePropertyInputType::Checkbox, -1.0f, 0.0f, 1.0f,
+                        "Tints unlit 2D objects with the ambient even when the scene has no Light 2D. "
+                        "On in new scenes; scenes saved before it have it off, so they look as they did.");
 
                     ImGui::EndTable();
                 }
@@ -14058,8 +14233,38 @@ void editor::InspectorWindow::show(){
                 ImGui::SeparatorText("Physics");
 
                 if (ImGui::BeginTable("scene_physics_table", 2, tableFlags)) {
-                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Interpolate"));
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, getLabelSize("Max Rotation Per Step"));
                     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+                    // S96: a physics world setting's row (physicsWorldSettingFields), one undo step each
+                    auto physicsWorldRow = [&](const PhysicsWorldSettingField& field) {
+                        switch (field.type) {
+                            case PhysicsWorldSettingField::Type::Float:
+                                drawScenePropertyRow<float>(sceneProject, field.snakeName, field.label, ScenePropertyInputType::DragFloat,
+                                                            6 * ImGui::GetFontSize(), field.minValue, field.maxValue, field.help);
+                                break;
+                            case PhysicsWorldSettingField::Type::Int:
+                                drawScenePropertyRow<int>(sceneProject, field.snakeName, field.label, ScenePropertyInputType::DragInt,
+                                                          6 * ImGui::GetFontSize(), field.minValue, field.maxValue, field.help);
+                                break;
+                            case PhysicsWorldSettingField::Type::Bool:
+                                drawScenePropertyRow<bool>(sceneProject, field.snakeName, field.label, ScenePropertyInputType::Checkbox,
+                                                           -1.0f, 0.0f, 1.0f, field.help);
+                                break;
+                        }
+                    };
+                    // the solver tuning of a world, folded: its defaults are what most games want
+                    auto physicsWorldFoldout = [&](bool is3D) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        const bool open = ImGui::TreeNodeEx(is3D ? "World##physics_3d_world" : "World##physics_2d_world", ImGuiTreeNodeFlags_SpanAvailWidth);
+                        ImGui::SetItemTooltip("The solver's tuning (Unity's Physics settings): iterations, bounce and sleep thresholds, stiffness");
+                        if (!open) return;
+                        for (const PhysicsWorldSettingField& field : physicsWorldSettingFields()) {
+                            if (field.is3D == is3D && field.advanced) physicsWorldRow(field);
+                        }
+                        ImGui::TreePop();
+                    };
 
                     if (sceneProject->sceneType == SceneType::SCENE_3D) {
                         drawScenePropertyRow<Vector3>(sceneProject, "physics_gravity_3d", "Gravity", ScenePropertyInputType::DragFloat, -1.0f, 0.0f, 1.0f,
@@ -14073,6 +14278,12 @@ void editor::InspectorWindow::show(){
                     if (sceneProject->sceneType != SceneType::SCENE_3D) {
                         drawScenePropertyRow<int>(sceneProject, "physics_2d_sub_steps", "Sub Steps", ScenePropertyInputType::DragInt, 6 * ImGui::GetFontSize(), 1.0f, 16.0f,
                             "Box2D solver sub-steps of each fixed step (1-16, default 4). More sub-steps make joint chains, stacks and stiff springs steadier, at a cost.");
+                        for (const PhysicsWorldSettingField& field : physicsWorldSettingFields()) {
+                            if (!field.is3D && !field.advanced) physicsWorldRow(field);
+                        }
+                        physicsWorldFoldout(false);
+                    } else {
+                        physicsWorldFoldout(true);
                     }
 
                     ImGui::EndTable();
@@ -14141,6 +14352,9 @@ void editor::InspectorWindow::show(){
 
                 ImGui::EndTable();
             }
+
+            // every scene type: its screen documents
+            drawSceneHtmlUi(sceneProject, tableFlags);
 
             ImGui::SeparatorText("Fixed Resolution");
             // R4: a Pixel Perfect Camera on the main camera drives the target instead

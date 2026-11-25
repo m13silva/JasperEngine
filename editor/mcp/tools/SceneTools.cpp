@@ -804,7 +804,7 @@ void setMainCameraTool(const CallPtr& call) {
 
 enum class SettingKind { Bool, Int, Float, Vector2, Vector3, Vector4, String, ShadowQuality, SceneColorScale, LightState, LitQuality, Filter, PostProcess,
                          PostProcessing, PostProcessingField, ShadowDebugView, CanvasScaler, PlanarReflectionResolution, LayerMask, ShaderUniforms,
-                         WaterWakeResolution };
+                         WaterWakeResolution, UIRenderMode };
 
 struct SceneSetting {
     std::string name;
@@ -844,6 +844,9 @@ const std::vector<SceneSetting>& sceneSettings() {
          "Scene view shadow debug view (editor only, never saved, no undo step): none, cascades, shadow_factor, texel_density, cache, atlas"},
         {"ambient_light_2d_color", SettingKind::Vector3, "2D ambient light color [r,g,b] (sRGB)"},
         {"ambient_light_2d_intensity", SettingKind::Float, "2D ambient light intensity"},
+        {"light_2d_steps", SettingKind::Int, "Light Steps: each Light 2D's light in this many hard bands, 0-16 (0 off: smooth)"},
+        {"ambient_light_2d_without_lights", SettingKind::Bool,
+         "the 2D ambient tints unlit 2D objects with no Light 2D in the scene too (on in new scenes; off in scenes saved before it, as they were drawn)"},
         {"shadows_2d_quality", SettingKind::ShadowQuality, "2D shadow edge filtering: none, low, medium, high (auto reads as low, ultra as high)"},
         {"physics_gravity_2d", SettingKind::Vector2, "2D gravity [x,y]"},
         {"physics_gravity_3d", SettingKind::Vector3, "3D gravity [x,y,z]"},
@@ -856,6 +859,10 @@ const std::vector<SceneSetting>& sceneSettings() {
         {"depth_prepass_enabled", SettingKind::Bool, "depth-only pass before opaque draws"},
         {"scene_color_scale", SettingKind::SceneColorScale,
          "resolution of the scene-colour copy shaders requiring scenecolor sample: full, half (default)"},
+        {"html_ui_render_mode", SettingKind::UIRenderMode,
+         "where screen HTML UI documents composite: overlay (default: after post-processing, at output resolution), "
+         "camera (in the camera pass: render scale and post apply)"},
+        {"html_ui_msaa_samples", SettingKind::Int, "MSAA samples of the screen HTML UI documents: 0 project default, 1, 2, 4, 8"},
         {"planar_reflection_resolution", SettingKind::PlanarReflectionResolution,
          "water planar reflection passes (one per water height a camera sees): off (none: the environment), quarter, half (default), full"},
         {"planar_reflection_layers", SettingKind::LayerMask, "layers the planar reflections draw (with the camera's culling mask)"},
@@ -909,6 +916,13 @@ const std::vector<SceneSetting>& sceneSettings() {
     };
     static const std::vector<SceneSetting> all = [](){
         std::vector<SceneSetting> list = settings;
+        // S96: the physics world settings, after the other physics ones
+        auto physicsAt = std::find_if(list.begin(), list.end(), [](const SceneSetting& s) { return s.name == "physics_2d_sub_steps"; }) + 1;
+        for (const PhysicsWorldSettingField& field : physicsWorldSettingFields()) {
+            const SettingKind kind = field.type == PhysicsWorldSettingField::Type::Bool ? SettingKind::Bool
+                                   : field.type == PhysicsWorldSettingField::Type::Int ? SettingKind::Int : SettingKind::Float;
+            physicsAt = list.insert(physicsAt, SceneSetting{field.snakeName, kind, field.help}) + 1;
+        }
         for (const PostProcessingSettings::Field& field : PostProcessingSettings::getFields()) {
             SceneSetting setting{std::string("post_processing.") + field.snakeName, SettingKind::PostProcessingField, field.help, false, &field};
             list.push_back(setting);
@@ -1085,6 +1099,7 @@ const char* kindName(SettingKind kind) {
         case SettingKind::ShadowDebugView:
         case SettingKind::PlanarReflectionResolution:
         case SettingKind::WaterWakeResolution:
+        case SettingKind::UIRenderMode:
         case SettingKind::Filter: return "enum";
         case SettingKind::LayerMask: return "layer_mask";
         case SettingKind::PostProcess: return "post_process";
@@ -1103,6 +1118,7 @@ const McpValues::EnumOptions* settingOptions(SettingKind kind) {
         case SettingKind::SceneColorScale: return McpValues::enumTable("scene_color_scale");
         case SettingKind::PlanarReflectionResolution: return McpValues::enumTable("planar_reflection_resolution");
         case SettingKind::WaterWakeResolution: return McpValues::enumTable("water_wake_resolution");
+        case SettingKind::UIRenderMode: return McpValues::enumTable("ui_render_mode");
         case SettingKind::LightState: return McpValues::enumTable("light_state");
         case SettingKind::LitQuality: return McpValues::enumTable("lit_quality");
         case SettingKind::Filter: return McpValues::enumTable("framebuffer_filter");
@@ -1230,6 +1246,10 @@ Json settingValue(Scene* scene, const SceneSetting& setting, bool defaults = fal
             return McpValues::enumToJson((int)(defaults ? Catalog::getScenePropertyDefault<WaterWakeResolution>(setting.name)
                                                         : Catalog::getSceneProperty<WaterWakeResolution>(scene, setting.name)),
                                          *settingOptions(setting.kind));
+        case SettingKind::UIRenderMode:
+            return McpValues::enumToJson((int)(defaults ? Catalog::getScenePropertyDefault<UIRenderMode>(setting.name)
+                                                        : Catalog::getSceneProperty<UIRenderMode>(scene, setting.name)),
+                                         *settingOptions(setting.kind));
         case SettingKind::LayerMask:
             return layerMaskToJson(defaults ? Catalog::getScenePropertyDefault<uint32_t>(setting.name)
                                             : Catalog::getSceneProperty<uint32_t>(scene, setting.name));
@@ -1310,14 +1330,26 @@ Command* buildSettingCommand(Project* project, SceneProject* scene, const SceneS
             return new ScenePropertyCmd<bool>(project, id, name, value.get<bool>());
         case SettingKind::Int:
             if (!value.is_number_integer()) return expect("an integer");
+            if (const PhysicsWorldSettingField* field = findPhysicsWorldSettingField(name);
+                field && (value.get<double>() < field->minValue || value.get<double>() > field->maxValue)) {
+                return expect(std::to_string((int)field->minValue) + " to " + std::to_string((int)field->maxValue));
+            }
             if (name.rfind("fixed_resolution_", 0) == 0 && value.get<int>() < 1) return expect("at least 1");
             if (name == "max_lights_per_object" && (value.get<int>() < 1 || value.get<int>() > 16)) return expect("1 to 16");
             if (name == "physics_2d_sub_steps" && (value.get<int>() < 1 || value.get<int>() > 16)) return expect("1 to 16");
             if (name == "max_planar_reflections" && (value.get<int>() < 1 || value.get<int>() > 4)) return expect("1 to 4");
+            if (name == "light_2d_steps" && (value.get<int>() < 0 || value.get<int>() > 16)) return expect("0 to 16");
             if (name == "ssr_debug_mode" && (value.get<int>() < 0 || value.get<int>() > 8)) return expect("0 to 8");
+            if (name == "html_ui_msaa_samples" && !Project::isValidHtmlUiMsaaSamples(value.get<int>()))
+                return expect("0 (the project's), 1, 2, 4 or 8");
             return new ScenePropertyCmd<int>(project, id, name, value.get<int>());
         case SettingKind::Float:
             if (!value.is_number()) return expect("a number");
+            if (const PhysicsWorldSettingField* field = findPhysicsWorldSettingField(name);
+                field && (value.get<double>() < field->minValue || value.get<double>() > field->maxValue)) {
+                return expect("a number from " + Json(McpValues::number(field->minValue)).dump() + " to " +
+                              Json(McpValues::number(field->maxValue)).dump());
+            }
             if (name == "physical_light_ev100" && (value.get<float>() < -6.0f || value.get<float>() > 24.0f)) return expect("-6 to 24");
             if (name == "capsule_shadow_intensity" && (value.get<float>() < 0.0f || value.get<float>() > 1.0f)) return expect("0 to 1");
             if (name == "capsule_shadow_softness" && (value.get<float>() < 0.0f || value.get<float>() > 2.0f)) return expect("0 to 2");
@@ -1369,6 +1401,7 @@ Command* buildSettingCommand(Project* project, SceneProject* scene, const SceneS
         }
         case SettingKind::PlanarReflectionResolution:
         case SettingKind::WaterWakeResolution:
+        case SettingKind::UIRenderMode:
         case SettingKind::ShadowQuality:
         case SettingKind::SceneColorScale:
         case SettingKind::LightState:
@@ -1386,6 +1419,7 @@ Command* buildSettingCommand(Project* project, SceneProject* scene, const SceneS
                 return new ScenePropertyCmd<PlanarReflectionResolution>(project, id, name, (PlanarReflectionResolution)parsed);
             if (setting.kind == SettingKind::WaterWakeResolution)
                 return new ScenePropertyCmd<WaterWakeResolution>(project, id, name, (WaterWakeResolution)parsed);
+            if (setting.kind == SettingKind::UIRenderMode) return new ScenePropertyCmd<UIRenderMode>(project, id, name, (UIRenderMode)parsed);
             if (setting.kind == SettingKind::LightState) return new ScenePropertyCmd<LightState>(project, id, name, (LightState)parsed);
             if (setting.kind == SettingKind::LitQuality) return new ScenePropertyCmd<LitQuality>(project, id, name, (LitQuality)parsed);
             return new ScenePropertyCmd<TextureFilter>(project, id, name, (TextureFilter)parsed);
@@ -2033,7 +2067,7 @@ void registerSceneTools(McpRegistry& registry) {
         tool.name = "open_scene";
         tool.title = "Open Scene";
         tool.description =
-            "Opens a .scene file (adding it to the project if unlisted) and selects it; an open scene is just selected.";
+            "Opens and selects a .scene file; an unlisted one stays out of the build (edit_build_scenes add).";
         tool.inputSchema = object({
             {"scene", sceneRef(".scene path, or id/name of a project scene.")},
             {"close_previous", withDefault(boolean("Close the previously selected scene."), false)},
