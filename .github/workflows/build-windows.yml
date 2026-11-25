@@ -41,6 +41,11 @@ jobs:
           for backend in d3d11 glcore; do
             tools/ci/players-windows.sh "$backend"
           done
+          
+      - name: Save ccache
+        uses: ./.github/actions/ccache-save
+        with:
+          lane: windows-editor
 
       - name: Put the runtimes next to the editor
         run: |
