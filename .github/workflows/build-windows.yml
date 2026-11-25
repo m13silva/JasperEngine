@@ -36,6 +36,18 @@ jobs:
       - name: Build editor
         run: tools/ci/windows.sh editor
 
+      - name: Build player runtimes (d3d11 + glcore, release)
+        run: |
+          for backend in d3d11 glcore; do
+            tools/ci/players-windows.sh "$backend"
+          done
+
+      - name: Put the runtimes next to the editor
+        run: |
+          mkdir -p instdir/bin/players
+          cp -r build/players/windows-x64-* instdir/bin/players/
+          ls -la instdir/bin/players
+
       - name: Upload editor
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
