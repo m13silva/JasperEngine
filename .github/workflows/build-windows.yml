@@ -30,7 +30,7 @@ jobs:
       - name: Restore ccache
         uses: ./.github/actions/ccache-restore
         with:
-          lane: windows
+          lane: windows-editor
           max-size: 2G
 
       - name: Build editor
