@@ -1,20 +1,29 @@
+
 name: Build Windows Editor
 
 on:
   workflow_dispatch:
+    inputs:
+      backends:
+        description: 'Backends de los player runtimes (JSON)'
+        default: '["glcore","d3d11"]'
+      flavours:
+        description: 'Flavours de los runtimes. Vacio = el valor por defecto del script (ej: release development)'
+        default: ''
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  build:
-    name: JasperEngine Editor (Windows x64)
+  # ---------------------------------------------------------------- EDITOR
+  editor:
+    name: Editor (Windows x64)
     runs-on: windows-latest
-
-    defaults:
-      run:
-        shell: bash
-
+    timeout-minutes: 360
     env:
       EDITOR_TESTS: '0'
 
@@ -33,30 +42,91 @@ jobs:
           lane: windows-editor
           max-size: 2G
 
+      # El paso tiene su propio limite (330 < 360 del job): si se pasa, falla el paso
+      # y los pasos de cache de abajo igual alcanzan a correr.
       - name: Build editor
+        timeout-minutes: 330
         run: tools/ci/windows.sh editor
 
-      - name: Build player runtimes (d3d11 + glcore, release)
-        run: |
-          for backend in d3d11 glcore; do
-            tools/ci/players-windows.sh "$backend"
-          done
-          
-      - name: Save ccache
-        uses: ./.github/actions/ccache-save
-        with:
-          lane: windows-editor
-
-      - name: Put the runtimes next to the editor
-        run: |
-          mkdir -p instdir/bin/players
-          cp -r build/players/windows-x64-* instdir/bin/players/
-          ls -la instdir/bin/players
-
+      # Se sube apenas termina de compilar, sin esperar a nada mas.
       - name: Upload editor
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: JasperEngine-Windows-x64
           path: instdir/bin/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
+
+      - name: Trim ccache
+        if: ${{ always() && env.JASPER_CCACHE_KEY != '' }}
+        run: CCACHE_MAXSIZE=2G ccache --cleanup || true
+
+      # Guarda lo compilado para que la proxima corrida arranque con cache.
+      - name: Save ccache
+        if: ${{ always() && env.JASPER_CCACHE_KEY != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/.cache/ccache
+          key: ${{ env.JASPER_CCACHE_KEY }}
+
+  # --------------------------------------------------------- PLAYER RUNTIMES
+  # Un job por backend, en paralelo y con su propio limite de 6 horas.
+  # Salen del mismo commit que el editor, asi que las versiones coinciden.
+  players:
+    name: Player runtime (${{ matrix.backend }})
+    runs-on: windows-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(inputs.backends) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Restore ccache
+        uses: ./.github/actions/ccache-restore
+        with:
+          lane: windows-players-${{ matrix.backend }}
+          max-size: 2G
+
+      - name: Build player runtime
+        timeout-minutes: 330
+        env:
+          BACKEND: ${{ matrix.backend }}
+          FLAVOURS: ${{ inputs.flavours }}
+        run: tools/ci/players-windows.sh "$BACKEND" ${FLAVOURS:+"$FLAVOURS"}
+
+      # Deja la carpeta como players/<id>/ para extraerla junto al editor.
+      - name: Stage runtime
+        run: |
+          mkdir -p stage/players
+          cp -r build/players/windows-x64-* stage/players/
+          ls -la stage/players
+
+      - name: Upload runtime
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: JasperEngine-players-windows-x64-${{ matrix.backend }}
+          path: stage/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Trim ccache
+        if: ${{ always() && env.JASPER_CCACHE_KEY != '' }}
+        run: CCACHE_MAXSIZE=2G ccache --cleanup || true
+
+      - name: Save ccache
+        if: ${{ always() && env.JASPER_CCACHE_KEY != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/.cache/ccache
+          key: ${{ env.JASPER_CCACHE_KEY }}
